@@ -152,7 +152,7 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         except Exception as e:
             print(f"❌ Failed to process {event_name}: {e}")
     
-# if __name__ == "__main__":
-#     scan_blocks("source")
-#     time.sleep(2)
-#     scan_blocks("destination")
+if __name__ == "__main__":
+    scan_blocks("source")
+    time.sleep(2)
+    scan_blocks("destination")
