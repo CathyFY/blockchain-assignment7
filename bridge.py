@@ -53,158 +53,132 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         return 0
     
         #YOUR CODE HERE
-    print(f"Starting bridge scan for {chain}...")
-
-    w3_source = connect_to('source')
-    w3_dest   = connect_to('destination')
-    w3 = w3_source if chain == "source" else w3_dest
-
-    # Load contract + key
+    w3 = connect_to(chain)
     contract_data = get_contract_info(chain, contract_info)
-    contract = w3.eth.contract(address=Web3.to_checksum_address(contract_data["address"]),
-                               abi=contract_data["abi"])
+    contract = w3.eth.contract(address=contract_data['address'], abi=contract_data['abi'])
 
-    with open(contract_info, 'r') as f:
-        full_info = json.load(f)
+    latest_block = w3.eth.get_block_number()
+    start_block = latest_block - 10
+    end_block = latest_block
 
-    private_key = full_info["warden_private_key"]
-    acct = w3.eth.account.from_key(private_key)
+    print(f"Scanning blocks {start_block} to {end_block} on {chain} chain")
 
-    # Direction mapping
-    if chain == "source":
-        event_name   = "Deposit"          # Source emits Deposit
-        target_w3    = w3_dest            # mirror to Destination.wrap
-        target_data  = full_info["destination"]
-        target_func  = "wrap"
-        use_legacy   = True               # BSC testnet likes legacy gas
-        gas_limit    = 300_000
-    else:
-        event_name   = "Unwrap"           # Destination emits Unwrap
-        target_w3    = w3_source          # mirror to Source.withdraw
-        target_data  = full_info["source"]
-        target_func  = "withdraw"
-        use_legacy   = False              # Fuji: EIP-1559 ok
-        gas_limit    = 300_000
-
-    target_contract = target_w3.eth.contract(
-        address=Web3.to_checksum_address(target_data["address"]),
-        abi=target_data["abi"]
-    )
-
-        # Block window
-    to_block   = w3.eth.block_number
-    lookback   = int(os.environ.get("LOOKBACK_BLOCKS", "1000"))  # keep small; RPCs cap ranges
-    from_block = max(0, to_block - lookback)
-
-    try:
-        # Build topic0 from ABI (guaranteed 0x-prefixed & 32 bytes)
-        event = getattr(contract.events, event_name)
-        eabi  = event._get_event_abi()
-        topic0 = to_hex(event_abi_to_log_topic(eabi))
-
-        # ---- adaptive chunked getLogs to avoid provider range limits ----
-        max_chunk = int(os.environ.get("LOG_CHUNK", "900"))  # Chainstack safe ~<=1000
-        min_chunk = 100
-        all_logs = []
-        start = from_block
-        while start <= to_block:
-            end = min(start + max_chunk, to_block)
-            fp = {
-                "fromBlock": start,
-                "toBlock":   end,
-                "address":   Web3.to_checksum_address(contract.address),
-                "topics":    [topic0, None, None, None],
-            }
-
-            ok = False
-            last_err = ""
-            for attempt in range(3):
-                try:
-                    got = w3.eth.get_logs(fp)
-                    all_logs.extend(got)
-                    ok = True
-                    break
-                except Exception as e:
-                    last_err = str(e)
-                    print(f"⚠️ get_logs {start}-{end} attempt {attempt+1}: {e}")
-                    time.sleep(2 ** attempt)
-
-            if not ok:
-                # If range-limited, halve the chunk and retry this window
-                if "range limit" in last_err.lower():
-                    if max_chunk <= min_chunk:
-                        print(f"❌ Provider limit even at {max_chunk}; skipping {start}-{end}")
-                        start = end + 1
-                    else:
-                        max_chunk = max(min_chunk, max_chunk // 2)
-                        print(f"↘️  Reducing chunk to {max_chunk} and retrying {start}-{min(start+max_chunk, to_block)}")
-                    continue
-                # Otherwise skip this window
-                start = end + 1
-                continue
-
-            start = end + 1
-
-        logs = [event().process_log(l) for l in all_logs]
-        print(f"🔎 {chain}: found {len(logs)} {event_name} event(s) in [{from_block},{to_block}] via {len(all_logs)} raw logs")
-
-    except Exception as e:
-        print(f"❌ Error setting up filter or fetching logs: {e}")
-        return
-
-    # Prepare a pending nonce on the *target* chain and increment locally
-    next_nonce = target_w3.eth.get_transaction_count(acct.address, "pending")
-
-    for log in logs:
-        print(f"\n📜 {event_name}: args keys={list(log['args'].keys())} values={dict(log['args'])}")
-        time.sleep(0.3)
+    if chain == 'source':
+        time.sleep(60)
+        dest_w3 = connect_to('destination')
+        dest_data = get_contract_info('destination', contract_info)
+        dest_contract = dest_w3.eth.contract(address=dest_data['address'], abi=dest_data['abi'])
 
         try:
-            if event_name == "Deposit":
-                # Source.Deposit(token, recipient, amount)
-                token     = Web3.to_checksum_address(log['args'].get('token') or log['args'].get('_token'))
-                recipient = Web3.to_checksum_address(log['args'].get('recipient') or log['args'].get('_recipient'))
-                amount    = int(log['args'].get('amount') or log['args'].get('_amount'))
-                fn = target_contract.functions.wrap(token, recipient, amount)
-            else:
-                # Destination.Unwrap(underlying, wrapped, from, to, amount)
-                token     = Web3.to_checksum_address(
-                    log['args'].get('underlying') or log['args'].get('underlying_token') or log['args'].get('token')
-                )
-                recipient = Web3.to_checksum_address(log['args'].get('to') or log['args'].get('_recipient'))
-                amount    = int(log['args'].get('amount') or log['args'].get('_amount'))
-                fn = target_contract.functions.withdraw(token, recipient, amount)
+            deposit_events = sorted(
+                contract.events.Deposit().get_logs(from_block=start_block, to_block=end_block),
+                key=lambda e: (e.blockNumber, e.logIndex)
+            )
+            print(f"Found {len(deposit_events)} Deposit events")
 
-            # Gas / fee params
-            tx_params = {
-                "from":  acct.address,
-                "nonce": next_nonce,
-                "gas":   gas_limit,
-            }
-            if use_legacy:
-                tx_params["gasPrice"] = max(target_w3.eth.gas_price, target_w3.to_wei(3, "gwei"))
-            else:
-                latest = target_w3.eth.get_block("latest")
-                base   = latest.get("baseFeePerGas")
-                if base is None:
-                    tx_params["gasPrice"] = target_w3.eth.gas_price
-                else:
-                    tx_params["maxPriorityFeePerGas"] = target_w3.to_wei(2, "gwei")
-                    tx_params["maxFeePerGas"]        = int(base * 2)
+            for i, event in enumerate(deposit_events):
+                token = event.args['token']
+                recipient = event.args['recipient']
+                amount = event.args['amount']
+                print(f"Processing Deposit {i+1}: token={token}, recipient={recipient}, amount={amount}")
 
-            tx = fn.build_transaction(tx_params)
-            signed = target_w3.eth.account.sign_transaction(tx, private_key)
-            txh = target_w3.eth.send_raw_transaction(signed.rawTransaction)
-            rcpt = target_w3.eth.wait_for_transaction_receipt(txh)
-            print(f"✅ {target_func} → {txh.hex()} status={rcpt.status} gasUsed={rcpt.gasUsed}")
-            next_nonce += 1
+                warden_key = dest_data.get('warden_key')
+                warden = dest_w3.eth.account.from_key(warden_key)
+                nonce = dest_w3.eth.get_transaction_count(warden.address)
+
+                try:
+                    gas_estimate = dest_contract.functions.wrap(token, recipient, amount).estimate_gas({'from': warden.address})
+                    gas_limit = int(gas_estimate * 1.2)
+                except:
+                    gas_limit = 200000
+
+                tx = dest_contract.functions.wrap(token, recipient, amount).build_transaction({
+                    'from': warden.address,
+                    'nonce': nonce,
+                    'gas': gas_limit,
+                    'gasPrice': dest_w3.eth.gas_price
+                })
+
+                signed = dest_w3.eth.account.sign_transaction(tx, warden_key)
+                tx_hash = dest_w3.eth.send_raw_transaction(signed.raw_transaction)
+                print(f"Wrap transaction sent: {tx_hash.hex()}")
+
+                receipt = dest_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                print(f"Wrap transaction confirmed in block {receipt.blockNumber}")
+
+                if i < len(deposit_events) - 1:
+                    time.sleep(1)
 
         except Exception as e:
-            print(f"❌ Failed to process {event_name}: {e}")
+            print(f"Error processing deposit events: {e}")
 
-            
+    elif chain == 'destination':
+        src_w3 = connect_to('source')
+        src_data = get_contract_info('source', contract_info)
+        src_contract = src_w3.eth.contract(address=src_data['address'], abi=src_data['abi'])
+
+        time.sleep(30)
+
+        unwrap_events = []
+        max_retries = 5
+
+        print(f"Scanning for Unwrap events from {start_block} to {end_block}, one block at a time")
+
+        for b in range(start_block, end_block + 1):
+            for attempt in range(max_retries):
+                try:
+                    logs = sorted(
+                        contract.events.Unwrap().get_logs(from_block=b, to_block=b),
+                        key=lambda e: (e.blockNumber, e['logIndex'])
+                    )
+                    unwrap_events.extend(logs)
+                    print(f"Got logs from block {b}")
+                    break
+                except Exception as e:
+                    print(f"Retry {attempt + 1}/{max_retries} failed for block {b}: {e}")
+                    time.sleep(min(2 ** attempt + uniform(0.1, 0.5), 10))
+            else:
+                print(f"All retries failed for block {b}")
+
+        print(f"Found {len(unwrap_events)} Unwrap events")
+
+        for i, event in enumerate(unwrap_events):
+            token = event.args['underlying_token']
+            to = event.args['to']
+            amount = event.args['amount']
+
+            print(f"Processing Unwrap {i+1}: token={token}, to={to}, amount={amount}")
+            warden_key = src_data.get('warden_key')
+            warden = src_w3.eth.account.from_key(warden_key)
+            nonce = src_w3.eth.get_transaction_count(warden.address)
+
+            try:
+                gas_estimate = src_contract.functions.withdraw(token, to, amount).estimate_gas({'from': warden.address})
+                gas_limit = int(gas_estimate * 1.2)
+            except:
+                gas_limit = 200000
+
+            tx = src_contract.functions.withdraw(token, to, amount).build_transaction({
+                'from': warden.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': src_w3.eth.gas_price
+            })
+
+            signed = src_w3.eth.account.sign_transaction(tx, warden_key)
+            tx_hash = src_w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"Withdraw transaction sent: {tx_hash.hex()}")
+
+            receipt = src_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            print(f"Withdraw confirmed in block {receipt.blockNumber}")
+
+            if i < len(unwrap_events) - 1:
+                time.sleep(2)
+
+    return 1
+
 if __name__ == "__main__":
-    scan_blocks("source")
-    time.sleep(2)
-    scan_blocks("destination")
+    scan_blocks("source")  
+    time.sleep(10)
+    scan_blocks("destination") 
     
